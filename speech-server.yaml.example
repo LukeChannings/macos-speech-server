@@ -33,7 +33,7 @@ stt:
   #   language: en      # ISO 639-1 code (e.g. en, fr, de); omit for auto-detect
 
 tts:
-  engine: pocket_tts    # Text-to-speech engine: pocket_tts | avspeech | kokoro
+  engine: pocket_tts    # Text-to-speech engine: pocket_tts | avspeech | kokoro | speechsynthesis
 
   # PocketTTS settings (only used when engine: pocket_tts)
   pocket_tts:
@@ -49,3 +49,14 @@ tts:
   # Uses FluidAudio's Kokoro model — 50 voices across 8 languages, 24 kHz, high quality.
   # kokoro:
   #   default_voice: af_heart   # Any Kokoro voice ID (e.g. af_heart, am_adam); default af_heart
+
+  # Speech Synthesis Manager settings (only used when engine: speechsynthesis)
+  # Shells out to macOS's /usr/bin/say. Unlike avspeech, this reaches the FULL
+  # system voice set — including high-quality Siri voices — regardless of how the
+  # binary is code-signed. No model downloads.
+  # speechsynthesis:
+  #   default_voice: System Voice   # "System Voice" = the OS System Voice (Settings → Accessibility
+  #                                 # → Spoken Content → System Voice, often a Siri voice);
+  #                                 # or a name from `say -v '?'` (e.g. "Daniel (Enhanced)");
+  #                                 # or a voice identifier (e.g. com.apple.siri.natural.en-GB-C).
+  #   sample_rate: 22050            # Output rate (Hz); say emits 22050 natively, other rates resample.

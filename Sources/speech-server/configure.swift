@@ -60,6 +60,13 @@ func configure(_ app: Application) async throws {
         app.logger.notice(
             "Kokoro TTS ready (\(ttsService.availableVoices.count) voices, default: \(ttsService.defaultVoice))."
         )
+    case .speechSynthesis:
+        let ttsService = SpeechSynthesisTTSService(
+            settings: config.tts.speechSynthesis ?? SpeechSynthesisSettings())
+        app.ttsService = ttsService
+        app.logger.notice(
+            "SpeechSynthesis TTS ready (\(ttsService.availableVoices.count) voices, default: \(ttsService.defaultVoice))."
+        )
     }
 
     // STT engine selection

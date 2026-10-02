@@ -190,12 +190,14 @@ struct TTSConfig: Codable, Sendable {
     var pocketTts: PocketTtsSettings?
     var avspeech: AVSpeechSettings?
     var kokoro: KokoroSettings?
+    var speechSynthesis: SpeechSynthesisSettings?
 
     init() {
         engine = .pocketTts
         pocketTts = nil
         avspeech = nil
         kokoro = nil
+        speechSynthesis = nil
     }
 
     init(from decoder: any Decoder) throws {
@@ -204,6 +206,7 @@ struct TTSConfig: Codable, Sendable {
         pocketTts = try c.decodeIfPresent(PocketTtsSettings.self, forKey: .pocketTts)
         avspeech = try c.decodeIfPresent(AVSpeechSettings.self, forKey: .avspeech)
         kokoro = try c.decodeIfPresent(KokoroSettings.self, forKey: .kokoro)
+        speechSynthesis = try c.decodeIfPresent(SpeechSynthesisSettings.self, forKey: .speechSynthesis)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -211,6 +214,7 @@ struct TTSConfig: Codable, Sendable {
         case pocketTts = "pocket_tts"
         case avspeech = "avspeech"
         case kokoro = "kokoro"
+        case speechSynthesis = "speechsynthesis"
     }
 }
 
@@ -218,6 +222,7 @@ enum TTSEngine: String, Codable, Sendable {
     case pocketTts = "pocket_tts"
     case avspeech = "avspeech"
     case kokoro = "kokoro"
+    case speechSynthesis = "speechsynthesis"
 }
 
 struct PocketTtsSettings: Codable, Sendable {
@@ -278,6 +283,34 @@ struct KokoroSettings: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case defaultVoice = "default_voice"
+    }
+}
+
+struct SpeechSynthesisSettings: Codable, Sendable {
+    /// Default voice for synthesis via the Carbon Speech Synthesis Manager.
+    /// Nil = "system" (the voice configured in System Settings → Accessibility →
+    /// Spoken Content → System Voice, which can be a high-quality Siri voice).
+    /// May also be a classic voice name (e.g. "Daniel") or a modern voice
+    /// identifier (e.g. "com.apple.siri.natural.en-GB-C").
+    var defaultVoice: String?
+    /// Output sample rate in Hz. The Carbon synthesiser natively emits 22050 Hz;
+    /// other rates are produced by resampling.
+    var sampleRate: Int
+
+    init() {
+        defaultVoice = nil
+        sampleRate = 22_050
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        defaultVoice = try c.decodeIfPresent(String.self, forKey: .defaultVoice)
+        sampleRate = try c.decodeIfPresent(Int.self, forKey: .sampleRate) ?? 22_050
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case defaultVoice = "default_voice"
+        case sampleRate = "sample_rate"
     }
 }
 

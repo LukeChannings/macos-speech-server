@@ -7,7 +7,7 @@ Essential knowledge for AI agents working on this codebase.
 A macOS-native HTTP server that exposes OpenAI-compatible speech API endpoints and a Wyoming protocol server for Home Assistant integration, running entirely on-device. Built with Vapor (Swift web framework) and FluidAudio (on-device ASR via Apple's Neural Engine).
 
 - **STT** is fully implemented using FluidAudio's `AsrManager`.
-- **TTS** is fully implemented with three engines: `pocket_tts` (FluidAudio PocketTTS, `alba` only), `avspeech` (macOS built-in, 150+ voices), and `kokoro` (FluidAudio Kokoro, 50 voices across 8 languages).
+- **TTS** is fully implemented with four engines: `pocket_tts` (FluidAudio PocketTTS, `alba` only), `avspeech` (macOS built-in, 150+ voices), `kokoro` (FluidAudio Kokoro, 50 voices across 8 languages), and `speechsynthesis` (macOS `/usr/bin/say`, reaches the full system voice set including Siri).
 
 ## Tech stack
 
@@ -64,7 +64,7 @@ ServerConfig
   │   ├─ http: HTTPConfig          (host, port, uploadLimitMB)
   │   └─ wyoming: WyomingConfig    (host, port)
   ├─ stt: STTConfig                (engine, parakeet/qwen3 settings)
-  └─ tts: TTSConfig                (engine, pocket_tts/avspeech/kokoro settings)
+  └─ tts: TTSConfig                (engine, pocket_tts/avspeech/kokoro/speechsynthesis settings)
 ```
 
 Access: `config.logLevel`, `config.servers.http.host`, `config.servers.wyoming.port`.
@@ -225,9 +225,11 @@ accumulate _all_ Float32 samples for a sentence and normalise once with a single
 `float32ToPCM16()` call.
 
 **Voice lookup**: stores `[String: String]` (lowercase name/identifier → canonical identifier),
-not `AVSpeechSynthesisVoice` objects (which are not `Sendable`). Siri voices are not
-accessible via public AVFoundation APIs and will not appear in the enumeration. Personal Voice
-support requires `requestPersonalVoiceAuthorization` and is tracked in issue #13.
+not `AVSpeechSynthesisVoice` objects (which are not `Sendable`). Siri voices are not reachable
+through `AVSpeechSynthesizer` from an ad-hoc-signed binary (the signing gate, see
+`SpeechSynthesisTTSService`) and will not appear in this engine's enumeration — use the
+`speechsynthesis` engine for Siri voices. Personal Voice support requires
+`requestPersonalVoiceAuthorization` and is tracked in issue #13.
 
 **Errors**: `AVSpeechTTSError.voiceNotFound(String)` is thrown when the requested voice name
 cannot be resolved via lookup. `AVSpeechTTSError.noAudioProduced` is thrown if the synthesiser
@@ -248,6 +250,60 @@ delivers zero samples (e.g. empty utterance after preprocessing).
 **`manager.synthesize()` returns WAV directly**: unlike PocketTTS which returns raw samples via `synthesizeDetailed().samples`, `KokoroTtsManager.synthesize()` returns a complete WAV `Data`. For streaming, `synthesizeDetailed()` returns a `KokoroSynthesizer.SynthesisResult` with `chunks: [ChunkInfo]`, each with `samples: [Float]`.
 
 **Errors**: `KokoroTTSError.notInitialized` and `KokoroTTSError.voiceNotFound(String)`.
+
+### SpeechSynthesisTTSService
+
+`SpeechSynthesisTTSService` (engine key `speechsynthesis`) shells out to macOS's
+`/usr/bin/say` (one short-lived process per sentence) rather than linking a synthesis
+framework. It exists because **`AVSpeechSynthesizer` gates the premium/Siri voice tier on
+the calling process's code signature**: an ad-hoc-signed binary (what `swift build` and the
+Homebrew/Nix packages produce) only sees the ~compact voices and can never reach the Siri
+"natural" voices. This was established empirically — in one GUI session, the Apple-signed
+`swift` driver enumerated 191 voices incl. Siri, an ad-hoc binary saw 181 without Siri, and
+`AVSpeechSynthesisVoice(identifier:)` for a Siri id returns nil from the ad-hoc binary. (This
+corrects the older claim elsewhere in this file that the limit is purely the GUI login
+session; signing is the dominant factor for the AVFoundation path.)
+
+Why `say` and not the in-process Carbon Speech Synthesis Manager (`NewSpeechChannel`/
+`SpeakCFString`): the Carbon path is **not** signing-gated and reaches the full voice set, but
+its audio rendering is tied to the **main run loop** — synthesis only completes on the process
+main thread (verified: 147 KB + done-callback on main; 4 KB + no callback on any background
+thread, including a dedicated thread running `CFRunLoopRun`). A Vapor server never pumps a
+`CFRunLoop` on main, so in-process Carbon synthesis stalls. `say` runs its own main-thread run
+loop in its own process, sidestepping this entirely, and is unaffected by *our* process's
+signature.
+
+1. On init: runs `say -v '?'`, parses each line into `(name, language)` (names can contain
+   spaces/parens, so the locale is the last whitespace token before the `#` comment; `_`→`-`).
+   `availableVoices` = `"System Voice"` ∪ `say` names ∪ the configured `default_voice` (sorted).
+   `defaultVoice` = the configured `default_voice`, or `"System Voice"` when unset/aliased.
+   Siri voices are not enumerable by any ad-hoc-reachable API, so the one friendly
+   `"System Voice"` option is the way to reach the configured Siri voice; its *language* for
+   Wyoming `describe` is read from `com.apple.Accessibility` →
+   `SpokenContentDefaultVoiceSelectionsByLanguage` (`configuredSystemVoiceIdentifiers()`).
+2. `synthesize`/`synthesizeStream`: split with `splitSentences()`, render each sentence to a
+   temp AIFF via `say`, read it back with `AVAudioFile` (resampling to `sampleRate` via
+   `AVAudioConverter` when the native 22050 Hz differs), convert with `float32ToPCM16()`.
+   `synthesize` accumulates all sentences then normalises once; `synthesizeStream` yields one
+   PCM chunk per sentence (same pattern as the other engines).
+3. **Voice resolution** (`resolveVoiceArgument`): `"System Voice"` (or the legacy alias
+   `"system"`, via `isSystemVoice`) → no `-v` (the OS System Voice, often Siri — byte-identical
+   to bare `say`); a name in the `say` list → `-v <name>`; a string containing `.` → treated as
+   an identifier and passed to `-v` verbatim (`say -v` accepts identifiers like
+   `com.apple.siri.natural.en-GB-C`); anything else → `voiceNotFound`.
+4. **Validation caveat**: `SpeechController` rejects any `voice` not in `availableVoices`
+   *before* calling the service. The Siri voice is reached via the always-present
+   `"System Voice"` option; to pin a *different* specific voice by identifier over the API set
+   it as `default_voice` (init advertises it). A bogus `say` voice exits 0 (prints a warning),
+   so we never rely on `say`'s exit status to detect an unknown voice — the
+   `resolveVoiceArgument` guard does that.
+5. Text is piped on **stdin** (not passed as an argv message) so arbitrary input, including
+   leading dashes, is never parsed as options. `genuine`-style concurrency: processes run in
+   parallel (no serialising queue); throughput is 2–5× realtime.
+6. `@unchecked Sendable`; all stored properties are immutable. No model downloads, 22050 Hz.
+
+**Errors**: `SpeechSynthesisTTSError.voiceNotFound(String)`, `.noAudioProduced`,
+`.sayFailed(status:message:)`, `.audioReadFailed`.
 
 ### PCMConversion utilities
 
@@ -341,6 +397,8 @@ Both `http.host` and `wyoming.host` are independently configurable — they do n
 | `AVSpeechTTSServiceTests.swift` | Real `AVSpeechTTSService` (uses macOS system voices) | No |
 | `KokoroConfigTests.swift` | YAML parsing for `kokoro` engine and `KokoroSettings` | No |
 | `KokoroTTSServiceTests.swift` | Real `KokoroTTSService` (Kokoro CoreML models) | Yes |
+| `SpeechSynthesisConfigTests.swift` | YAML parsing for `speechsynthesis` engine and `SpeechSynthesisSettings` | No |
+| `SpeechSynthesisTTSServiceTests.swift` | Real `SpeechSynthesisTTSService` (uses `/usr/bin/say`) | No |
 | `Qwen3ConfigTests.swift` | YAML parsing for `qwen3` engine and `Qwen3STTSettings` | No |
 | `Helpers/MockServices.swift` | `MockTTSService` + `MockSTTService` for session tests | No |
 
@@ -425,6 +483,8 @@ swift test --filter ServerConfig  # run a specific test class
 | `AVSpeechTTSServiceTests.swift` | Unit | Real `AVSpeechTTSService` using macOS system voices — no models needed |
 | `KokoroConfigTests.swift` | Unit | YAML parsing for `kokoro` engine and `KokoroSettings` — no models needed |
 | `KokoroTTSServiceTests.swift` | Integration | Real `KokoroTTSService` with Kokoro CoreML models |
+| `SpeechSynthesisConfigTests.swift` | Unit | YAML parsing for `speechsynthesis` engine and `SpeechSynthesisSettings` — no models needed |
+| `SpeechSynthesisTTSServiceTests.swift` | Unit | Real `SpeechSynthesisTTSService` via `/usr/bin/say` — no models needed |
 | `Qwen3ConfigTests.swift` | Unit | YAML parsing for `qwen3` engine and `Qwen3STTSettings` — no models needed |
 | `Helpers/MockServices.swift` | Helper | MockTTSService + MockSTTService |
 

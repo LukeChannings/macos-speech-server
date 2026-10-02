@@ -50,7 +50,7 @@ By default the server only listens on `127.0.0.1` (HTTP port 8080, Wyoming port 
 
 Running as a system service at boot (dedicated role account), switching between the per-user and system service, and migrating from the old `deploy/` scripts are covered in [docs/install.md](docs/install.md).
 
-> **Warning: macOS system voices are limited under the system service.** A LaunchDaemon has no GUI login session, so `AVSpeechSynthesizer` only sees the ~70 built-in compact voices. Enhanced/Premium voices you downloaded (`Zoe (Premium)`, `Daniel (Enhanced)`, …) and the multi-locale voices (Eddy, Flo, Grandma, Grandpa, Reed, Rocko, Sandy, Shelley, …) are not listed and cannot be used. There is no known workaround. To use them with the `avspeech` engine, run the per-user service (`brew services start macos-speech-server`) as a user who stays logged in, and enable automatic login if the Mac must serve after a reboot. Voices downloaded by any user on the Mac are visible to every logged-in user. `pocket_tts` and `kokoro` are unaffected.
+> **Warning: macOS system voices are limited under the system service.** A LaunchDaemon has no GUI login session, so `AVSpeechSynthesizer` only sees the ~70 built-in compact voices. Enhanced/Premium voices you downloaded (`Zoe (Premium)`, `Daniel (Enhanced)`, …) and the multi-locale voices (Eddy, Flo, Grandma, Grandpa, Reed, Rocko, Sandy, Shelley, …) are not listed and cannot be used. There is no known workaround. To use them with the `avspeech` engine, run the per-user service (`brew services start macos-speech-server`) as a user who stays logged in, and enable automatic login if the Mac must serve after a reboot. Voices downloaded by any user on the Mac are visible to every logged-in user. `pocket_tts`, `kokoro`, and `speechsynthesis` are unaffected — in particular the `speechsynthesis` engine reaches the full voice set (including Siri voices) regardless of code signing, though the GUI-login-session limit on *enumerating* downloaded voices still applies under a LaunchDaemon.
 
 ### Upgrading
 
@@ -105,7 +105,7 @@ stt:
   #   language: en      # ISO 639-1 code; omit for auto-detect
 
 tts:
-  engine: pocket_tts    # pocket_tts (default) | avspeech | kokoro
+  engine: pocket_tts    # pocket_tts (default) | avspeech | kokoro | speechsynthesis
 
   # AVSpeech settings (only used when engine: avspeech)
   # avspeech:
@@ -115,6 +115,11 @@ tts:
   # Kokoro TTS settings (only used when engine: kokoro)
   # kokoro:
   #   default_voice: af_heart   # Any Kokoro voice ID (e.g. af_heart, am_adam); default af_heart
+
+  # Speech Synthesis Manager settings (only used when engine: speechsynthesis)
+  # speechsynthesis:
+  #   default_voice: System Voice  # "System Voice" (OS System Voice), a `say -v '?'` name, or an identifier
+  #   sample_rate: 22050           # Output rate (Hz); say emits 22050 natively
 ```
 
 All fields are optional — omitted fields use the defaults shown above.
@@ -150,13 +155,14 @@ Supported languages: zh, en, yue, ar, de, fr, es, pt, id, it, ko, ru, th, vi, ja
 
 ### TTS engines
 
-Three TTS engines are available:
+Four TTS engines are available:
 
 | Engine | `engine:` value | Voices | Sample rate | Downloads | Notes |
 |--------|----------------|--------|-------------|-----------|-------|
 | FluidAudio PocketTTS | `pocket_tts` | `alba` only | 24 kHz | ~200 MB on first start | Default |
 | macOS AVSpeech | `avspeech` | 150+ system voices | 22050 Hz | None (ships with macOS) | Instant startup |
 | FluidAudio Kokoro | `kokoro` | 50 voices, 8 languages | 24 kHz | ~300 MB on first start | High quality |
+| macOS Speech Synthesis (`say`) | `speechsynthesis` | Full system voice set, incl. Siri | 22050 Hz | None (ships with macOS) | Reaches Siri voices; unaffected by code signing |
 
 #### `pocket_tts` (default)
 
@@ -183,7 +189,9 @@ The short name (e.g. `Samantha`, `Daniel`, `Karen`) is used in API requests. Voi
 
 **Enhanced and Premium voices.** Download them in System Settings > Accessibility > Spoken Content (on macOS 15+ via the VoiceOver Utility voice list). They appear as separate voices named with their quality, e.g. `Daniel` and `Daniel (Enhanced)`, `Zoe (Premium)`; pass that full display name as `voice`. Prefer names over identifiers because the identifier can differ from the name (`Jamie (Premium)` is `com.apple.voice.premium.en-GB.Malcolm`). These voices are **not available under the system service** -- see the warning in [Installation](#advanced-installation).
 
-> **Note:** Siri voices are not accessible via public AVFoundation APIs and will not appear in the voice list.
+> **Note:** Siri voices are not reachable through `AVSpeechSynthesizer` in an ad-hoc-signed
+> build and will not appear in this engine's voice list. To use a Siri voice, use the
+> `speechsynthesis` engine instead (below).
 > Personal Voice support (macOS 14+) is planned — see issue #13.
 
 #### `kokoro` — FluidAudio Kokoro
@@ -200,6 +208,26 @@ tts:
 American English voices (production-quality): `af_alloy`, `af_aoede`, `af_bella`, `af_heart`, `af_jessica`, `af_kore`, `af_nicole`, `af_nova`, `af_river`, `af_sarah`, `af_sky`, `am_adam`, `am_echo`, `am_eric`, `am_fenrir`, `am_liam`, `am_michael`, `am_onyx`, `am_puck`, `am_santa`.
 
 Other language voices are experimental (not QA'd). Full voice list: use `/v1/audio/speech` with an invalid voice to see the available options listed in the error message.
+
+#### `speechsynthesis` — macOS `say` (reaches Siri voices)
+
+Shells out to macOS's `/usr/bin/say`. Unlike the `avspeech` engine, this reaches the **full system voice set — including high-quality Siri voices** — regardless of how the server binary is code-signed. (`AVSpeechSynthesizer` gates premium/Siri voices on the process's code signature, so an ad-hoc-signed build — what `swift build` and the Homebrew/Nix packages produce — only sees the compact voices. The `say` path is not subject to that gate because synthesis runs in Apple's own `say` process.) No model downloads; audio is produced at 22050 Hz mono (16-bit PCM), resampled if you set a different `sample_rate`.
+
+```yaml
+tts:
+  engine: speechsynthesis
+  speechsynthesis:
+    default_voice: System Voice  # Optional — see below
+    sample_rate: 22050           # Optional — say emits 22050 Hz; other values resample
+```
+
+`default_voice` accepts:
+
+- `System Voice` (the default) — the voice configured in **System Settings → Accessibility → Spoken Content → System Voice**, which is typically a Siri voice. This matches exactly what `/usr/bin/say` produces with no `-v` flag, and is always offered in the voice list (and Wyoming `describe`) as `System Voice`. (The legacy alias `system` is also accepted.)
+- a voice **name** from `say -v '?'` (e.g. `Daniel (Enhanced)`).
+- a voice **identifier** (e.g. `com.apple.siri.natural.en-GB-C`).
+
+Because Siri voices are not enumerated by `say -v '?'`, the Siri voice is exposed through the single `System Voice` option (pick it in Home Assistant, or request `"voice": "System Voice"`). To pin a *different* specific voice by identifier over the API, set it as `default_voice` — that also advertises it in the voice list. Requests with no `voice` field use `default_voice`.
 
 ### Config discovery order
 
@@ -290,7 +318,7 @@ Content-Type: application/json
 | `response_format` | String | No       | `wav` (default) or `pcm`                           |
 | `speed`           | Double | No       | Playback speed, 0.25-4.0 (default: 1.0)           |
 
-The response is **streamed**: audio begins arriving before synthesis is complete, sentence by sentence. WAV responses include a standard 44-byte header (with unknown-size placeholders) followed by 16-bit PCM; PCM responses are raw 16-bit bytes. The sample rate depends on the active TTS engine (24 kHz for `pocket_tts` and `kokoro`, 22050 Hz for `avspeech`).
+The response is **streamed**: audio begins arriving before synthesis is complete, sentence by sentence. WAV responses include a standard 44-byte header (with unknown-size placeholders) followed by 16-bit PCM; PCM responses are raw 16-bit bytes. The sample rate depends on the active TTS engine (24 kHz for `pocket_tts` and `kokoro`, 22050 Hz for `avspeech` and `speechsynthesis`).
 
 Example:
 
@@ -416,6 +444,7 @@ Sources/speech-server/
     FluidTTSService.swift          # FluidAudio PocketTTS implementation (pocket_tts engine)
     AVSpeechTTSService.swift       # macOS AVSpeechSynthesizer implementation (avspeech engine)
     KokoroTTSService.swift         # FluidAudio Kokoro implementation (kokoro engine)
+    SpeechSynthesisTTSService.swift # macOS `say` implementation (speechsynthesis engine)
     PCMConversion.swift            # Shared Float32→Int16 PCM conversion and WAV builder
     SentenceDetection.swift        # Shared sentence splitting for TTS
   Middleware/
