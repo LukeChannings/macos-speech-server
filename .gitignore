@@ -63,3 +63,8 @@ fastlane/test_output
 
 # Local config file (may contain private IPs or personal settings)
 speech-server.yaml
+
+# Nix
+/result
+/result-*
+.direnv
