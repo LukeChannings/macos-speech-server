@@ -60,3 +60,7 @@ tts:
   #                                 # or a name from `say -v '?'` (e.g. "Daniel (Enhanced)");
   #                                 # or a voice identifier (e.g. com.apple.siri.natural.en-GB-C).
   #   sample_rate: 22050            # Output rate (Hz); say emits 22050 natively, other rates resample.
+  #   use_helper: true              # Keep a persistent speech channel for the System Voice
+  #                                 # (~0.2 s warm time-to-first-audio instead of ~1 s per request).
+  #                                 # Falls back to `say` automatically if the helper is missing.
+  #   helper_path: /path/to/speech-synthesis-helper  # Default: next to the speech-server binary.

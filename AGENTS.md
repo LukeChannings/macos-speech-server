@@ -253,9 +253,11 @@ delivers zero samples (e.g. empty utterance after preprocessing).
 
 ### SpeechSynthesisTTSService
 
-`SpeechSynthesisTTSService` (engine key `speechsynthesis`) shells out to macOS's
-`/usr/bin/say` (one process per synthesis, its growing WAV output tailed in real time)
-rather than linking a synthesis framework. It exists because **`AVSpeechSynthesizer` gates the premium/Siri voice tier on
+`SpeechSynthesisTTSService` (engine key `speechsynthesis`) has two render paths: a
+persistent Carbon SSM helper process for the System Voice (warm time-to-first-audio
+~0.2 s) and `/usr/bin/say` (one process per synthesis, its growing WAV output tailed
+in real time, ~1 s to first audio) for named/identifier voices and as the fallback.
+It does not link a synthesis framework in-process. It exists because **`AVSpeechSynthesizer` gates the premium/Siri voice tier on
 the calling process's code signature**: an ad-hoc-signed binary (what `swift build` and the
 Homebrew/Nix packages produce) only sees the ~compact voices and can never reach the Siri
 "natural" voices. This was established empirically — in one GUI session, the Apple-signed
@@ -317,12 +319,79 @@ signature.
 5. Text is piped on **stdin** (not passed as an argv message) so arbitrary input, including
    leading dashes, is never parsed as options.
 6. `@unchecked Sendable`; all stored properties are immutable. No model downloads, 22050 Hz.
+7. **Persistent SSM helper fast path** (`speech-synthesis-helper`, a second executable
+   product; see its own section below): when the requested voice is the System Voice and
+   `use_helper` is not disabled, `synthesizeStream` routes through `SSMHelperClient`
+   instead of spawning `say`. Any helper problem — missing binary, crash, busy with a
+   concurrent request, output-rate mismatch with the configured `sample_rate` — falls
+   back to the `say` path silently (`SSMHelperClient.Outcome.unavailable`), preserving
+   both the old behaviour and request parallelism. `.failed` is only surfaced when audio
+   was already yielded (the response can't be restarted). The helper is located via
+   `helper_path` or as a sibling of the server executable
+   (`Bundle.main.executableURL`, symlinks resolved — works for `swift run` and for
+   Homebrew's `bin` symlinks).
 
 **Errors**: `SpeechSynthesisTTSError.voiceNotFound(String)`, `.noAudioProduced`,
-`.sayFailed(status:message:)`, `.audioReadFailed` (malformed/unparseable WAV from `say`).
+`.sayFailed(status:message:)`, `.audioReadFailed` (malformed/unparseable WAV from `say`),
+`.helperFailed(String)` (helper error after audio was already streamed).
 `.noAudioProduced` is thrown by `synthesize` when the stream yields no bytes (e.g.
 whitespace-only input — `say` exits 0 with an empty `data` chunk); `synthesizeStream`
 finishes empty in that case (headers may already be on the wire).
+
+### speech-synthesis-helper (persistent Carbon SSM renderer)
+
+A small second executable product (`Sources/speech-synthesis-helper/main.swift`, shared
+code in the `SpeechSynthesisHelperCore` library target) that eliminates the per-request
+latency floor of the `say` path for the System Voice (measured: warm first-audio drops
+from ~1 s to ~0.2 s end-to-end; see `docs/plans/speechsynthesis-latency-floor.md` for
+the full investigation).
+
+**Why a separate process**: Carbon SSM synthesis only completes on a thread whose run
+loop is pumped — a Vapor server never pumps main. The helper pumps its own main run
+loop (exactly like `say`) and keeps a **long-lived speech channel**, so the voice
+session survives across requests. The SSM path is not signing-gated: its output for the
+System Voice is byte-identical to `say`'s (verified).
+
+**Empirical constraints that shaped the design** (all verified, macOS 26):
+
+- SSM **cannot stream to a pipe**: `kSpeechOutputToFileDescriptorProperty` accepts a
+  pipe fd but writes zero bytes and degrades synthesis to realtime. Each request
+  therefore renders to a temp AIFF via `kSpeechOutputToFileURLProperty`, which SSM
+  writes progressively (~25 ms cadence, ~5× realtime); the helper tails it in-process.
+- The AIFF payload is 16-bit **big-endian** at the voice's native rate (22050 Hz for
+  Siri/compact voices); the helper locates it with `aiffStreamInfo(in:)`
+  (`SpeechSynthesisHelperCore/AIFFChunkParsing.swift` — handles the CoreAudio header
+  padding and the 80-bit extended-float COMM rate) and byteswaps to LE before framing.
+- `StopSpeech` and `StopSpeechAt(kImmediate)` return `noErr` but are **ignored for
+  render-to-file synthesis**; the only way to abort a cancelled request is
+  `DisposeSpeechChannel` mid-render (safe; the next request creates a fresh channel,
+  ~0.3 s instead of ~0.2 s to first audio).
+- The first synthesis in a fresh process pays ~1 s of SSM/voice session setup, so the
+  helper **pre-warms** its channel with a throwaway utterance at startup, and the
+  service spawns the helper at init (`SSMHelperClient.prewarm()`) rather than on first
+  request.
+
+**Wire protocol** (`SpeechSynthesisHelperCore/HelperProtocol.swift`): stdin carries
+u32-LE-length-prefixed JSON requests (`{"text": ...}` / `{"cancel": true}`); stdout
+carries typed frames (1 type byte + u32 LE length + payload): `S` start (JSON rate +
+channels), `A` audio (LE PCM, ≤32 KiB, whole 16-bit frames), `E` end, `X` error
+(terminal — no `E` follows an `X`). The helper is strictly serial; exits on stdin EOF
+or stdout EPIPE.
+
+**`SSMHelperClient`** (service side, actor): spawns/respawns the helper, buffers frames
+from a dedicated stdout-reader thread via an actor-internal queue (an
+`AsyncStream.AsyncIterator` cannot be stored across actor awaits — region isolation),
+serialises use with a `busy` flag, and after a cancelled request drains the stale
+frames (watchdog kills a wedged helper after 3 s — the watchdog must check
+`Task.isCancelled` after its sleep, because a cancelled sleep returns immediately and
+would otherwise terminate a healthy helper). Task cancellation sends `{"cancel":true}`
+from the `onCancel` handler; `AsyncStream` iteration finishing early on cancellation is
+disambiguated from helper death via `Task.isCancelled`.
+
+**Homebrew coupling**: the formula must install **both** products
+(`speech-server` and `speech-synthesis-helper`) into `bin` — the service looks for the
+helper next to its own (symlink-resolved) executable. If the helper is missing the
+engine still works via `say`, just with the old ~1 s floor.
 
 ### PCMConversion utilities
 
@@ -419,6 +488,9 @@ Both `http.host` and `wyoming.host` are independently configurable — they do n
 | `KokoroTTSServiceTests.swift` | Real `KokoroTTSService` (Kokoro CoreML models) | Yes |
 | `SpeechSynthesisConfigTests.swift` | YAML parsing for `speechsynthesis` engine and `SpeechSynthesisSettings` | No |
 | `WAVChunkParsingTests.swift` | `wavDataPayloadOffset()` RIFF chunk walker (incl. `FLLR` layout) | No |
+| `AIFFChunkParsingTests.swift` | `aiffStreamInfo()` AIFF chunk walker + ext80 rate + byteswap | No |
+| `HelperProtocolTests.swift` | SSM helper frame/request encode/decode, partial feeds | No |
+| `SSMHelperIntegrationTests.swift` | Real `speech-synthesis-helper` binary over its protocol + service fast path/fallback | No |
 | `SpeechSynthesisTTSServiceTests.swift` | Real `SpeechSynthesisTTSService` (uses `/usr/bin/say`) | No |
 | `Qwen3ConfigTests.swift` | YAML parsing for `qwen3` engine and `Qwen3STTSettings` | No |
 | `Helpers/MockServices.swift` | `MockTTSService` + `MockSTTService` for session tests | No |
@@ -506,6 +578,9 @@ swift test --filter ServerConfig  # run a specific test class
 | `KokoroTTSServiceTests.swift` | Integration | Real `KokoroTTSService` with Kokoro CoreML models |
 | `SpeechSynthesisConfigTests.swift` | Unit | YAML parsing for `speechsynthesis` engine and `SpeechSynthesisSettings` — no models needed |
 | `WAVChunkParsingTests.swift` | Unit | `wavDataPayloadOffset()` RIFF chunk walker — no models needed |
+| `AIFFChunkParsingTests.swift` | Unit | `aiffStreamInfo()` AIFF chunk walker — no models needed |
+| `HelperProtocolTests.swift` | Unit | SSM helper wire protocol — no models needed |
+| `SSMHelperIntegrationTests.swift` | Integration | Real helper binary + service routing — no models needed |
 | `SpeechSynthesisTTSServiceTests.swift` | Unit | Real `SpeechSynthesisTTSService` via `/usr/bin/say` — no models needed |
 | `Qwen3ConfigTests.swift` | Unit | YAML parsing for `qwen3` engine and `Qwen3STTSettings` — no models needed |
 | `Helpers/MockServices.swift` | Helper | MockTTSService + MockSTTService |
