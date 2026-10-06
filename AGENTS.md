@@ -254,8 +254,8 @@ delivers zero samples (e.g. empty utterance after preprocessing).
 ### SpeechSynthesisTTSService
 
 `SpeechSynthesisTTSService` (engine key `speechsynthesis`) shells out to macOS's
-`/usr/bin/say` (one short-lived process per sentence) rather than linking a synthesis
-framework. It exists because **`AVSpeechSynthesizer` gates the premium/Siri voice tier on
+`/usr/bin/say` (one process per synthesis, its growing WAV output tailed in real time)
+rather than linking a synthesis framework. It exists because **`AVSpeechSynthesizer` gates the premium/Siri voice tier on
 the calling process's code signature**: an ad-hoc-signed binary (what `swift build` and the
 Homebrew/Nix packages produce) only sees the ~compact voices and can never reach the Siri
 "natural" voices. This was established empirically — in one GUI session, the Apple-signed
@@ -281,11 +281,28 @@ signature.
    `"System Voice"` option is the way to reach the configured Siri voice; its *language* for
    Wyoming `describe` is read from `com.apple.Accessibility` →
    `SpokenContentDefaultVoiceSelectionsByLanguage` (`configuredSystemVoiceIdentifiers()`).
-2. `synthesize`/`synthesizeStream`: split with `splitSentences()`, render each sentence to a
-   temp AIFF via `say`, read it back with `AVAudioFile` (resampling to `sampleRate` via
-   `AVAudioConverter` when the native 22050 Hz differs), convert with `float32ToPCM16()`.
-   `synthesize` accumulates all sentences then normalises once; `synthesizeStream` yields one
-   PCM chunk per sentence (same pattern as the other engines).
+2. `synthesizeStream` streams in **real time** by tailing `say`'s output file: one `say`
+   process per synthesis renders the *whole* text (no sentence splitting — `say` handles
+   prosody natively) with `--file-format=WAVE --data-format=LEI16@<sampleRate> -o <tmp>.wav`,
+   i.e. little-endian 16-bit mono PCM at the configured rate (`say` resamples natively — no
+   `AVAudioConverter`). The file is polled every 50 ms; new payload bytes are yielded as PCM
+   chunks (capped at 32 KiB, trimmed to even 16-bit frame boundaries) as synthesis proceeds.
+   First audio arrives ~1 s in; synthesis runs several times faster than realtime. The `data`
+   chunk payload offset is found with `wavDataPayloadOffset(in:)` (`WAVChunkParsing.swift`) —
+   CoreAudio inserts a `FLLR` page-alignment chunk, so the payload starts at offset 4096, not
+   44. `synthesize` collects the stream and wraps it with `makeWAV()`. Output is `say`'s
+   native level — **no peak normalisation** (unlike the other engines' `float32ToPCM16()`
+   path), which also avoids per-sentence loudness jumps.
+2a. **Why tail a file instead of a pipe**: `say -o` to a FIFO exits 0 but writes zero bytes
+   (the AudioFile API needs a seekable file). `say` does, however, write the output file
+   progressively during synthesis (verified empirically for WAVE and AIFF, compact and Siri
+   system voices alike), so tailing is reliable. The header scan is capped at 64 KiB →
+   `.audioReadFailed` if no `data` chunk is found.
+2b. **Cancellation**: the stream's `onTermination` terminates the `say` process (via a small
+   `@unchecked Sendable` `ProcessBox`, since `Process` is not `Sendable`) and cancels the
+   tail task, so a disconnecting HTTP/Wyoming client never leaks a `say` process; the temp
+   WAV is removed by `defer`. A SIGTERM we sent ourselves is not misreported as `.sayFailed`
+   (guarded by `Task.isCancelled`).
 3. **Voice resolution** (`resolveVoiceArgument`): `"System Voice"` (or the legacy alias
    `"system"`, via `isSystemVoice`) → no `-v` (the OS System Voice, often Siri — byte-identical
    to bare `say`); a name in the `say` list → `-v <name>`; a string containing `.` → treated as
@@ -298,16 +315,19 @@ signature.
    so we never rely on `say`'s exit status to detect an unknown voice — the
    `resolveVoiceArgument` guard does that.
 5. Text is piped on **stdin** (not passed as an argv message) so arbitrary input, including
-   leading dashes, is never parsed as options. `genuine`-style concurrency: processes run in
-   parallel (no serialising queue); throughput is 2–5× realtime.
+   leading dashes, is never parsed as options.
 6. `@unchecked Sendable`; all stored properties are immutable. No model downloads, 22050 Hz.
 
 **Errors**: `SpeechSynthesisTTSError.voiceNotFound(String)`, `.noAudioProduced`,
-`.sayFailed(status:message:)`, `.audioReadFailed`.
+`.sayFailed(status:message:)`, `.audioReadFailed` (malformed/unparseable WAV from `say`).
+`.noAudioProduced` is thrown by `synthesize` when the stream yields no bytes (e.g.
+whitespace-only input — `say` exits 0 with an empty `data` chunk); `synthesizeStream`
+finishes empty in that case (headers may already be on the wire).
 
 ### PCMConversion utilities
 
-`PCMConversion.swift` provides two package-internal free functions shared by all TTS services:
+`PCMConversion.swift` provides two package-internal free functions shared by the TTS services
+(`speechsynthesis` streams `say`'s native 16-bit PCM directly and only uses `makeWAV`):
 
 - `float32ToPCM16(_ samples: [Float]) -> Data` — peak-normalises the sample batch (or uses
   1.0 if all samples are silent) and converts to little-endian Int16 PCM bytes.
@@ -398,6 +418,7 @@ Both `http.host` and `wyoming.host` are independently configurable — they do n
 | `KokoroConfigTests.swift` | YAML parsing for `kokoro` engine and `KokoroSettings` | No |
 | `KokoroTTSServiceTests.swift` | Real `KokoroTTSService` (Kokoro CoreML models) | Yes |
 | `SpeechSynthesisConfigTests.swift` | YAML parsing for `speechsynthesis` engine and `SpeechSynthesisSettings` | No |
+| `WAVChunkParsingTests.swift` | `wavDataPayloadOffset()` RIFF chunk walker (incl. `FLLR` layout) | No |
 | `SpeechSynthesisTTSServiceTests.swift` | Real `SpeechSynthesisTTSService` (uses `/usr/bin/say`) | No |
 | `Qwen3ConfigTests.swift` | YAML parsing for `qwen3` engine and `Qwen3STTSettings` | No |
 | `Helpers/MockServices.swift` | `MockTTSService` + `MockSTTService` for session tests | No |
@@ -484,6 +505,7 @@ swift test --filter ServerConfig  # run a specific test class
 | `KokoroConfigTests.swift` | Unit | YAML parsing for `kokoro` engine and `KokoroSettings` — no models needed |
 | `KokoroTTSServiceTests.swift` | Integration | Real `KokoroTTSService` with Kokoro CoreML models |
 | `SpeechSynthesisConfigTests.swift` | Unit | YAML parsing for `speechsynthesis` engine and `SpeechSynthesisSettings` — no models needed |
+| `WAVChunkParsingTests.swift` | Unit | `wavDataPayloadOffset()` RIFF chunk walker — no models needed |
 | `SpeechSynthesisTTSServiceTests.swift` | Unit | Real `SpeechSynthesisTTSService` via `/usr/bin/say` — no models needed |
 | `Qwen3ConfigTests.swift` | Unit | YAML parsing for `qwen3` engine and `Qwen3STTSettings` — no models needed |
 | `Helpers/MockServices.swift` | Helper | MockTTSService + MockSTTService |

@@ -156,6 +156,82 @@ final class SpeechSynthesisTTSServiceTests: XCTestCase {
         }
     }
 
+    // MARK: - Real-time streaming behaviour
+
+    func testSynthesizeStreamLongSingleSentenceYieldsMultipleChunks() async throws {
+        // A single long sentence must stream as multiple chunks. The old
+        // per-sentence implementation could only ever yield one chunk here;
+        // tailing `say`'s output file yields chunks as audio is synthesised.
+        let text =
+            "This is one very long sentence without any internal punctuation that goes on "
+            + "and on for quite a while so that the synthesiser takes several seconds to "
+            + "render it and the streaming implementation has ample opportunity to deliver "
+            + "partial audio to the listener well before the synthesis run has completed"
+        let stream = service.synthesizeStream(text: text, voice: "System Voice")
+        var chunks = 0
+        for try await chunk in stream {
+            XCTAssertEqual(chunk.count % 2, 0, "16-bit PCM chunks must be even length")
+            chunks += 1
+        }
+        XCTAssertGreaterThanOrEqual(
+            chunks, 2,
+            "A long single sentence must stream incrementally, not as one blob"
+        )
+    }
+
+    func testSynthesizeStreamFirstChunkArrivesBeforeCompletion() async throws {
+        let text =
+            "The quick brown fox jumps over the lazy dog while the slow grey wolf watches "
+            + "from a distance and ponders the meaning of all this needless jumping around. "
+            + "Pack my box with five dozen liquor jugs and carry it carefully down the hill."
+        let start = Date()
+        var firstChunkAt: TimeInterval?
+        let stream = service.synthesizeStream(text: text, voice: "System Voice")
+        for try await _ in stream where firstChunkAt == nil {
+            firstChunkAt = Date().timeIntervalSince(start)
+        }
+        let total = Date().timeIntervalSince(start)
+        let first = try XCTUnwrap(firstChunkAt, "Stream must yield at least one chunk")
+        // Lenient bound to avoid CI flakiness: the first chunk must arrive in
+        // well under the total stream time for a multi-second synthesis.
+        XCTAssertLessThan(
+            first, total * 0.6,
+            "First chunk (\(first)s) must arrive well before stream completion (\(total)s)"
+        )
+    }
+
+    func testSynthesizeStreamEarlyTerminationReturnsPromptly() async throws {
+        let text =
+            "This long text would take many seconds to synthesise in full but the consumer "
+            + "is going to stop listening after the very first chunk arrives and the stream "
+            + "must wind down promptly instead of rendering all of the remaining audio. "
+            + "More filler text follows to make the full synthesis take even longer than it "
+            + "otherwise would have taken on a fast machine with a warm synthesiser cache."
+        let stream = service.synthesizeStream(text: text, voice: "System Voice")
+        for try await _ in stream {
+            break  // Abandon the stream after the first chunk.
+        }
+        // Reaching here without hanging is the main assertion; give the
+        // teardown a moment, then verify the service is still usable.
+        let data = try await service.synthesize(text: "Still working.", voice: "System Voice")
+        XCTAssertGreaterThan(data.count, 44)
+    }
+
+    func testSynthesizeWhitespaceOnlyThrowsNoAudioProduced() async {
+        do {
+            _ = try await service.synthesize(text: "   ", voice: "System Voice")
+            XCTFail("Expected noAudioProduced error")
+        }
+        catch let error as SpeechSynthesisTTSError {
+            guard case .noAudioProduced = error else {
+                return XCTFail("Unexpected SpeechSynthesisTTSError: \(error)")
+            }
+        }
+        catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
     // MARK: - Classic voice by name
 
     func testSynthesizeClassicVoiceByName() async throws {
