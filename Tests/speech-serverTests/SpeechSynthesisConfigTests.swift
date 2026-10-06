@@ -18,6 +18,33 @@ final class SpeechSynthesisConfigTests: XCTestCase {
         let settings = SpeechSynthesisSettings()
         XCTAssertNil(settings.defaultVoice)
         XCTAssertEqual(settings.sampleRate, 22_050)
+        XCTAssertTrue(settings.useHelper)
+        XCTAssertNil(settings.helperPath)
+    }
+
+    func testHelperSettingsDefaultWhenAbsentFromYAML() throws {
+        let yaml = """
+            tts:
+              engine: speechsynthesis
+              speechsynthesis:
+                sample_rate: 22050
+            """
+        let config = try YAMLDecoder().decode(ServerConfig.self, from: yaml)
+        XCTAssertEqual(config.tts.speechSynthesis?.useHelper, true)
+        XCTAssertNil(config.tts.speechSynthesis?.helperPath)
+    }
+
+    func testParseHelperSettings() throws {
+        let yaml = """
+            tts:
+              engine: speechsynthesis
+              speechsynthesis:
+                use_helper: false
+                helper_path: /opt/custom/speech-synthesis-helper
+            """
+        let config = try YAMLDecoder().decode(ServerConfig.self, from: yaml)
+        XCTAssertEqual(config.tts.speechSynthesis?.useHelper, false)
+        XCTAssertEqual(config.tts.speechSynthesis?.helperPath, "/opt/custom/speech-synthesis-helper")
     }
 
     func testDefaultConfigHasNoSpeechSynthesisBlock() {

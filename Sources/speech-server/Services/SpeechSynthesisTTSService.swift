@@ -56,6 +56,9 @@ final class SpeechSynthesisTTSService: TTSService, @unchecked Sendable {
     private let voiceLanguages: [String: String]
     // Language of the configured System Voice (from Accessibility prefs), if known.
     private let systemVoiceLanguage: String?
+    // Persistent SSM helper for low-latency System Voice synthesis; nil when
+    // disabled via config. Missing binary / crashes degrade to the `say` path.
+    private let helperClient: SSMHelperClient?
     private let logger: Logger
 
     init(settings: SpeechSynthesisSettings = SpeechSynthesisSettings()) {
@@ -93,6 +96,30 @@ final class SpeechSynthesisTTSService: TTSService, @unchecked Sendable {
         var l = Logger(label: "SpeechSynthesisTTSService")
         l.logLevel = .notice
         self.logger = l
+
+        if settings.useHelper, let helperURL = Self.helperExecutableURL(settings: settings) {
+            let client = SSMHelperClient(helperURL: helperURL)
+            self.helperClient = client
+            // Fire-and-forget: spawn the helper now (it pre-warms its speech
+            // channel on startup) so the first request is already warm.
+            Task { await client.prewarm() }
+        }
+        else {
+            self.helperClient = nil
+        }
+    }
+
+    /// Locates the `speech-synthesis-helper` binary: an explicit `helper_path`
+    /// setting wins; otherwise it is expected next to the server executable
+    /// (both are products of this package and are installed side by side).
+    private static func helperExecutableURL(settings: SpeechSynthesisSettings) -> URL? {
+        if let path = settings.helperPath {
+            return URL(fileURLWithPath: path)
+        }
+        return Bundle.main.executableURL?
+            .resolvingSymlinksInPath()
+            .deletingLastPathComponent()
+            .appendingPathComponent("speech-synthesis-helper")
     }
 
     // MARK: - TTSService
@@ -117,7 +144,55 @@ final class SpeechSynthesisTTSService: TTSService, @unchecked Sendable {
         let argumentResult = Result { try resolveVoiceArgument(voice) }
         logger.notice("SpeechSynthesis synthesizeStream: \(text.count) character(s)")
 
-        return AsyncThrowingStream { continuation in
+        // Fast path: System Voice through the persistent SSM helper. Named
+        // and identifier voices keep the `say` path (the helper's channel is
+        // bound to the system default voice).
+        if case .success(.none) = argumentResult, let client = helperClient {
+            return helperFirstStream(text: text, client: client)
+        }
+        return sayStream(text: text, argumentResult: argumentResult)
+    }
+
+    /// Streams via the SSM helper, falling back to `say` when the helper is
+    /// unavailable (missing, busy, crashed before audio, rate mismatch).
+    private func helperFirstStream(
+        text: String, client: SSMHelperClient
+    ) -> AsyncThrowingStream<
+        Data, Error
+    > {
+        AsyncThrowingStream { continuation in
+            let box = ProcessBox()
+            let task = Task {
+                let outcome = await client.run(text: text, expectedRate: self.sampleRate) { chunk in
+                    continuation.yield(chunk)
+                }
+                switch outcome {
+                case .completed:
+                    continuation.finish()
+                case .failed(let error):
+                    continuation.finish(throwing: error)
+                case .unavailable:
+                    do {
+                        try await self.streamSay(
+                            text: text, voiceArgument: nil, box: box, continuation: continuation)
+                        continuation.finish()
+                    }
+                    catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+                box.terminate()
+            }
+        }
+    }
+
+    private func sayStream(
+        text: String, argumentResult: Result<String?, any Error>
+    ) -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream { continuation in
             let box = ProcessBox()
             let task = Task {
                 do {
@@ -363,6 +438,7 @@ enum SpeechSynthesisTTSError: Error, CustomStringConvertible {
     case noAudioProduced
     case sayFailed(status: Int, message: String)
     case audioReadFailed
+    case helperFailed(String)
 
     var description: String {
         switch self {
@@ -375,6 +451,8 @@ enum SpeechSynthesisTTSError: Error, CustomStringConvertible {
             return "`say` failed (exit \(status))\(message.isEmpty ? "" : ": \(message)")."
         case .audioReadFailed:
             return "Failed to parse the audio produced by `say`."
+        case .helperFailed(let message):
+            return "Speech synthesis helper failed: \(message)."
         }
     }
 }

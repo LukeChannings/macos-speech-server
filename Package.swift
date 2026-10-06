@@ -20,9 +20,24 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
     ],
     targets: [
+        // Shared wire protocol + AIFF parsing for the persistent Speech
+        // Synthesis Manager helper (no external dependencies).
+        .target(
+            name: "SpeechSynthesisHelperCore"
+        ),
+        // Persistent Carbon SSM helper: pumps a main-thread run loop and keeps
+        // a long-lived speech channel so the System Voice model stays loaded
+        // across requests (see docs/plans/speechsynthesis-latency-floor.md).
+        .executableTarget(
+            name: "speech-synthesis-helper",
+            dependencies: [
+                .target(name: "SpeechSynthesisHelperCore")
+            ]
+        ),
         .executableTarget(
             name: "speech-server",
             dependencies: [
+                .target(name: "SpeechSynthesisHelperCore"),
                 .product(name: "Vapor", package: "vapor"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "MultipartKit", package: "multipart-kit"),
@@ -35,6 +50,7 @@ let package = Package(
             name: "speech-serverTests",
             dependencies: [
                 .target(name: "speech-server"),
+                .target(name: "SpeechSynthesisHelperCore"),
                 .product(name: "XCTVapor", package: "vapor"),
                 .product(name: "Yams", package: "Yams"),
             ],
