@@ -1,4 +1,3 @@
-import AVFoundation
 import Foundation
 import Logging
 
@@ -28,10 +27,18 @@ import Logging
 ///  - a voice *identifier* (e.g. `"com.apple.siri.natural.en-GB-C"`); `say -v` accepts
 ///    identifiers as well as names.
 ///
-/// Each synthesis spawns a short-lived `say` process writing an AIFF, which is then
-/// read (and resampled if needed) into mono Float32. Processes run concurrently;
-/// throughput is 2–5× realtime, so sentence-granularity streaming stays ahead of
-/// playback.
+/// Streaming: `say` cannot write audio to a pipe (`-o` to a FIFO exits 0 but
+/// produces zero bytes — the AudioFile API needs a seekable file), but it *does*
+/// write its output file progressively as it synthesises (verified empirically:
+/// first audio bytes land ~0.5–0.75 s in, then the file grows steadily). Each
+/// synthesis therefore spawns one `say` process writing a WAV
+/// (`--file-format=WAVE --data-format=LEI16@<rate>`, i.e. little-endian 16-bit
+/// mono PCM at the configured sample rate — no resampling or byte-swapping
+/// needed) and tails the growing file, yielding new PCM bytes as they appear.
+/// Time-to-first-audio is sub-second instead of the full synthesis time, and
+/// `say` handles sentence prosody across the whole input natively, so no
+/// sentence splitting is needed. Output is `say`'s native level (no peak
+/// normalisation) — exactly what `say` users hear.
 final class SpeechSynthesisTTSService: TTSService, @unchecked Sendable {
     /// Friendly voice name mapping to the OS-configured System Voice (no `-v`).
     /// The legacy alias "system" is also accepted (see `isSystemVoice`).
@@ -97,36 +104,37 @@ final class SpeechSynthesisTTSService: TTSService, @unchecked Sendable {
     }
 
     func synthesize(text: String, voice: String) async throws -> Data {
-        let argument = try resolveVoiceArgument(voice)
-        var all: [Float] = []
-        for sentence in splitSentences(text) {
-            all.append(contentsOf: try await renderSentence(sentence, voiceArgument: argument))
+        var pcm = Data()
+        for try await chunk in synthesizeStream(text: text, voice: voice) {
+            pcm.append(chunk)
         }
-        guard !all.isEmpty else { throw SpeechSynthesisTTSError.noAudioProduced }
-        logger.notice("SpeechSynthesis synthesize: \(all.count) samples → WAV")
-        return makeWAV(pcmData: float32ToPCM16(all), sampleRate: sampleRate)
+        guard !pcm.isEmpty else { throw SpeechSynthesisTTSError.noAudioProduced }
+        logger.notice("SpeechSynthesis synthesize: \(pcm.count) PCM bytes → WAV")
+        return makeWAV(pcmData: pcm, sampleRate: sampleRate)
     }
 
     func synthesizeStream(text: String, voice: String) -> AsyncThrowingStream<Data, Error> {
         let argumentResult = Result { try resolveVoiceArgument(voice) }
-        let sentences = splitSentences(text)
-        logger.notice("SpeechSynthesis synthesizeStream: \(sentences.count) sentence(s)")
+        logger.notice("SpeechSynthesis synthesizeStream: \(text.count) character(s)")
 
         return AsyncThrowingStream { continuation in
-            Task {
+            let box = ProcessBox()
+            let task = Task {
                 do {
                     let argument = try argumentResult.get()
-                    for sentence in sentences {
-                        let samples = try await self.renderSentence(sentence, voiceArgument: argument)
-                        if !samples.isEmpty {
-                            continuation.yield(float32ToPCM16(samples))
-                        }
-                    }
+                    try await self.streamSay(
+                        text: text, voiceArgument: argument, box: box, continuation: continuation)
                     continuation.finish()
                 }
                 catch {
                     continuation.finish(throwing: error)
                 }
+            }
+            continuation.onTermination = { _ in
+                // A disconnecting consumer must kill `say` instead of leaking
+                // a process that renders audio nobody will hear.
+                task.cancel()
+                box.terminate()
             }
         }
     }
@@ -156,105 +164,124 @@ final class SpeechSynthesisTTSService: TTSService, @unchecked Sendable {
         return lower == systemVoice.lowercased() || lower == "system"
     }
 
-    // MARK: - Rendering
+    // MARK: - Rendering (tail `say`'s growing WAV)
 
-    private func renderSentence(_ text: String, voiceArgument: String?) async throws -> [Float] {
+    /// Cap on how many bytes to scan for the `data` chunk before giving up.
+    /// `say` places the payload at offset 4096 (page-aligned via a `FLLR`
+    /// filler chunk); 64 KiB is a generous safety margin.
+    private static let maxHeaderSearchBytes = 64 * 1024
+    /// Maximum PCM bytes per yielded chunk (~0.74 s of audio at 22 050 Hz).
+    private static let maxChunkBytes = 32 * 1024
+    /// Tail poll interval.
+    private static let pollNanoseconds: UInt64 = 50_000_000
+
+    /// Spawns one `say` process for the whole text, writing little-endian
+    /// 16-bit mono PCM WAV at `sampleRate`, and tails the growing file,
+    /// yielding new payload bytes to `continuation` as they are synthesised.
+    private func streamSay(
+        text: String,
+        voiceArgument: String?,
+        box: ProcessBox,
+        continuation: AsyncThrowingStream<Data, Error>.Continuation
+    ) async throws {
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString + ".aiff")
+            .appendingPathComponent(UUID().uuidString + ".wav")
         defer { try? FileManager.default.removeItem(at: url) }
-        try await runSay(text: text, voiceArgument: voiceArgument, to: url)
-        return try readResampledMono(url: url, targetRate: sampleRate)
-    }
 
-    /// Runs `say`, piping the text on stdin (so arbitrary text, including leading
-    /// dashes, is never parsed as options) and writing an AIFF to `url`.
-    private func runSay(text: String, voiceArgument: String?, to url: URL) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: Self.sayPath)
-            var arguments = ["-o", url.path]
-            if let voiceArgument { arguments.append(contentsOf: ["-v", voiceArgument]) }
-            process.arguments = arguments
+        let process = box.process
+        process.executableURL = URL(fileURLWithPath: Self.sayPath)
+        var arguments = [
+            "--file-format=WAVE", "--data-format=LEI16@\(sampleRate)", "-o", url.path,
+        ]
+        if let voiceArgument { arguments.append(contentsOf: ["-v", voiceArgument]) }
+        process.arguments = arguments
 
-            let stdin = Pipe()
-            let stderr = Pipe()
-            process.standardInput = stdin
-            process.standardError = stderr
+        // Text goes on stdin so arbitrary input (including leading dashes) is
+        // never parsed as options.
+        let stdin = Pipe()
+        let stderr = Pipe()
+        process.standardInput = stdin
+        process.standardError = stderr
 
-            process.terminationHandler = { proc in
-                if proc.terminationStatus == 0 {
-                    continuation.resume()
+        try process.run()
+        let stdinHandle = stdin.fileHandleForWriting
+        stdinHandle.write(Data(text.utf8))
+        try? stdinHandle.close()
+
+        var header = Data()
+        var payloadOffset: Int?
+        var pending = Data()
+        var fileHandle: FileHandle?
+        defer { try? fileHandle?.close() }
+
+        while true {
+            // Capture liveness BEFORE reading: when `exited` is true, the
+            // reads below happen after process exit and therefore see the
+            // complete file.
+            let exited = !process.isRunning
+
+            if fileHandle == nil {
+                // `say` creates the output file shortly after starting.
+                fileHandle = try? FileHandle(forReadingFrom: url)
+            }
+
+            if let handle = fileHandle {
+                while true {
+                    let bytes = handle.readData(ofLength: 65_536)
+                    if bytes.isEmpty { break }
+                    if payloadOffset != nil {
+                        pending.append(bytes)
+                    }
+                    else {
+                        header.append(bytes)
+                        if let offset = wavDataPayloadOffset(in: header) {
+                            payloadOffset = offset
+                            if header.count > offset {
+                                pending.append(header.subdata(in: offset..<header.count))
+                            }
+                            header.removeAll(keepingCapacity: false)
+                        }
+                        else if header.count > Self.maxHeaderSearchBytes {
+                            throw SpeechSynthesisTTSError.audioReadFailed
+                        }
+                    }
                 }
-                else {
-                    let message =
-                        String(
-                            data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    continuation.resume(
-                        throwing: SpeechSynthesisTTSError.sayFailed(
-                            status: Int(proc.terminationStatus), message: message))
+
+                // Yield complete 16-bit frames in capped chunks; keep any odd
+                // trailing byte pending until its other half arrives.
+                while pending.count >= 2 {
+                    let take = min(pending.count & ~1, Self.maxChunkBytes)
+                    continuation.yield(Data(pending.prefix(take)))
+                    pending.removeFirst(take)
                 }
             }
 
-            do {
-                try process.run()
-                let handle = stdin.fileHandleForWriting
-                handle.write(Data(text.utf8))
-                try? handle.close()
-            }
-            catch {
-                continuation.resume(throwing: error)
-            }
+            if exited || Task.isCancelled { break }
+            try? await Task.sleep(nanoseconds: Self.pollNanoseconds)
+        }
+
+        // A cancelled consumer already got everything it wanted; don't
+        // misreport the SIGTERM we sent as a synthesis failure.
+        if Task.isCancelled { return }
+
+        if process.terminationStatus != 0 {
+            let message =
+                String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw SpeechSynthesisTTSError.sayFailed(
+                status: Int(process.terminationStatus), message: message)
         }
     }
 
-    /// Reads an AIFF file into mono Float32 samples at `targetRate`, resampling if needed.
-    private func readResampledMono(url: URL, targetRate: Int) throws -> [Float] {
-        let file = try AVAudioFile(forReading: url)
-        let srcFormat = file.processingFormat
-        let frameCount = AVAudioFrameCount(file.length)
-        guard frameCount > 0,
-            let inBuffer = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: frameCount)
-        else { return [] }
-        try file.read(into: inBuffer)
+    /// Minimal `@unchecked Sendable` wrapper so the stream's `onTermination`
+    /// closure can terminate the `say` process (`Process` itself is not
+    /// `Sendable`).
+    private final class ProcessBox: @unchecked Sendable {
+        let process = Process()
 
-        if srcFormat.sampleRate == Double(targetRate) && srcFormat.channelCount == 1 {
-            return Self.floatSamples(inBuffer)
+        func terminate() {
+            if process.isRunning { process.terminate() }
         }
-
-        guard
-            let outFormat = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32, sampleRate: Double(targetRate),
-                channels: 1, interleaved: false),
-            let converter = AVAudioConverter(from: srcFormat, to: outFormat)
-        else {
-            throw SpeechSynthesisTTSError.audioReadFailed
-        }
-
-        let capacity =
-            AVAudioFrameCount(Double(frameCount) * Double(targetRate) / srcFormat.sampleRate) + 2_048
-        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: capacity) else {
-            throw SpeechSynthesisTTSError.audioReadFailed
-        }
-
-        var provided = false
-        var convError: NSError?
-        _ = converter.convert(to: outBuffer, error: &convError) { _, inStatus in
-            if provided {
-                inStatus.pointee = .noDataNow
-                return nil
-            }
-            provided = true
-            inStatus.pointee = .haveData
-            return inBuffer
-        }
-        if let convError { throw convError }
-        return Self.floatSamples(outBuffer)
-    }
-
-    private static func floatSamples(_ buffer: AVAudioPCMBuffer) -> [Float] {
-        guard let channelData = buffer.floatChannelData else { return [] }
-        return Array(UnsafeBufferPointer(start: channelData[0], count: Int(buffer.frameLength)))
     }
 
     /// The voice identifiers configured under System Settings → Accessibility →
@@ -347,7 +374,7 @@ enum SpeechSynthesisTTSError: Error, CustomStringConvertible {
         case .sayFailed(let status, let message):
             return "`say` failed (exit \(status))\(message.isEmpty ? "" : ": \(message)")."
         case .audioReadFailed:
-            return "Failed to read or resample the audio produced by `say`."
+            return "Failed to parse the audio produced by `say`."
         }
     }
 }

@@ -211,14 +211,16 @@ Other language voices are experimental (not QA'd). Full voice list: use `/v1/aud
 
 #### `speechsynthesis` — macOS `say` (reaches Siri voices)
 
-Shells out to macOS's `/usr/bin/say`. Unlike the `avspeech` engine, this reaches the **full system voice set — including high-quality Siri voices** — regardless of how the server binary is code-signed. (`AVSpeechSynthesizer` gates premium/Siri voices on the process's code signature, so an ad-hoc-signed build — what `swift build` and the Homebrew/Nix packages produce — only sees the compact voices. The `say` path is not subject to that gate because synthesis runs in Apple's own `say` process.) No model downloads; audio is produced at 22050 Hz mono (16-bit PCM), resampled if you set a different `sample_rate`.
+Shells out to macOS's `/usr/bin/say`. Unlike the `avspeech` engine, this reaches the **full system voice set — including high-quality Siri voices** — regardless of how the server binary is code-signed. (`AVSpeechSynthesizer` gates premium/Siri voices on the process's code signature, so an ad-hoc-signed build — what `swift build` and the Homebrew/Nix packages produce — only sees the compact voices. The `say` path is not subject to that gate because synthesis runs in Apple's own `say` process.) No model downloads; audio is produced at 22050 Hz mono (16-bit PCM), or at a different rate if you set `sample_rate` (`say` resamples natively).
+
+Responses stream in **real time**: the engine tails `say`'s output file as it is written, so the first audio bytes arrive about a second after the request — long before the full synthesis finishes — and playback can start immediately while the rest streams in (synthesis runs several times faster than realtime).
 
 ```yaml
 tts:
   engine: speechsynthesis
   speechsynthesis:
     default_voice: System Voice  # Optional — see below
-    sample_rate: 22050           # Optional — say emits 22050 Hz; other values resample
+    sample_rate: 22050           # Optional — say emits 22050 Hz natively; other values make say resample
 ```
 
 `default_voice` accepts:
@@ -318,7 +320,7 @@ Content-Type: application/json
 | `response_format` | String | No       | `wav` (default) or `pcm`                           |
 | `speed`           | Double | No       | Playback speed, 0.25-4.0 (default: 1.0)           |
 
-The response is **streamed**: audio begins arriving before synthesis is complete, sentence by sentence. WAV responses include a standard 44-byte header (with unknown-size placeholders) followed by 16-bit PCM; PCM responses are raw 16-bit bytes. The sample rate depends on the active TTS engine (24 kHz for `pocket_tts` and `kokoro`, 22050 Hz for `avspeech` and `speechsynthesis`).
+The response is **streamed**: audio begins arriving before synthesis is complete — sentence by sentence for `pocket_tts`, `avspeech`, and `kokoro`, and continuously (sub-second first byte) for `speechsynthesis`. WAV responses include a standard 44-byte header (with unknown-size placeholders) followed by 16-bit PCM; PCM responses are raw 16-bit bytes. The sample rate depends on the active TTS engine (24 kHz for `pocket_tts` and `kokoro`, 22050 Hz for `avspeech` and `speechsynthesis`).
 
 Example:
 
