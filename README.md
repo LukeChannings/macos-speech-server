@@ -213,14 +213,17 @@ Other language voices are experimental (not QA'd). Full voice list: use `/v1/aud
 
 Shells out to macOS's `/usr/bin/say`. Unlike the `avspeech` engine, this reaches the **full system voice set — including high-quality Siri voices** — regardless of how the server binary is code-signed. (`AVSpeechSynthesizer` gates premium/Siri voices on the process's code signature, so an ad-hoc-signed build — what `swift build` and the Homebrew/Nix packages produce — only sees the compact voices. The `say` path is not subject to that gate because synthesis runs in Apple's own `say` process.) No model downloads; audio is produced at 22050 Hz mono (16-bit PCM), or at a different rate if you set `sample_rate` (`say` resamples natively).
 
-Responses stream in **real time**: the engine tails `say`'s output file as it is written, so the first audio bytes arrive about a second after the request — long before the full synthesis finishes — and playback can start immediately while the rest streams in (synthesis runs several times faster than realtime).
+Responses stream in **real time**, and the System Voice gets a dedicated fast path: a small persistent helper process (`speech-synthesis-helper`, installed alongside the server) keeps the voice loaded across requests, so warm time-to-first-audio is **~0.2 s**. Named voices (and the fallback when the helper is unavailable) go through `say`, whose output file is tailed as it is written — first audio in about a second, long before the full synthesis finishes. Either way playback can start immediately while the rest streams in (synthesis runs several times faster than realtime).
 
 ```yaml
 tts:
   engine: speechsynthesis
   speechsynthesis:
     default_voice: System Voice  # Optional — see below
-    sample_rate: 22050           # Optional — say emits 22050 Hz natively; other values make say resample
+    sample_rate: 22050           # Optional — the native rate; other values make say resample
+                                 # (and disable the fast-path helper, which emits 22050 Hz)
+    use_helper: true             # Optional — set false to always use `say`
+    helper_path: /path/to/speech-synthesis-helper  # Optional — default: next to the server binary
 ```
 
 `default_voice` accepts:

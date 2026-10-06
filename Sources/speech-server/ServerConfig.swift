@@ -296,21 +296,35 @@ struct SpeechSynthesisSettings: Codable, Sendable {
     /// Output sample rate in Hz. The Carbon synthesiser natively emits 22050 Hz;
     /// other rates are produced by resampling.
     var sampleRate: Int
+    /// Whether to use the persistent `speech-synthesis-helper` process for
+    /// System Voice synthesis (sub-100 ms warm time-to-first-audio instead of
+    /// ~1 s per `say` invocation). When the helper binary is missing or
+    /// crashes, the engine silently falls back to `say`. Default: true.
+    var useHelper: Bool
+    /// Explicit path to the `speech-synthesis-helper` binary. Default: nil =
+    /// look next to the server executable.
+    var helperPath: String?
 
     init() {
         defaultVoice = nil
         sampleRate = 22_050
+        useHelper = true
+        helperPath = nil
     }
 
     init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         defaultVoice = try c.decodeIfPresent(String.self, forKey: .defaultVoice)
         sampleRate = try c.decodeIfPresent(Int.self, forKey: .sampleRate) ?? 22_050
+        useHelper = try c.decodeIfPresent(Bool.self, forKey: .useHelper) ?? true
+        helperPath = try c.decodeIfPresent(String.self, forKey: .helperPath)
     }
 
     enum CodingKeys: String, CodingKey {
         case defaultVoice = "default_voice"
         case sampleRate = "sample_rate"
+        case useHelper = "use_helper"
+        case helperPath = "helper_path"
     }
 }
 
