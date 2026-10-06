@@ -388,10 +388,14 @@ would otherwise terminate a healthy helper). Task cancellation sends `{"cancel":
 from the `onCancel` handler; `AsyncStream` iteration finishing early on cancellation is
 disambiguated from helper death via `Task.isCancelled`.
 
-**Homebrew coupling**: the formula must install **both** products
-(`speech-server` and `speech-synthesis-helper`) into `bin` — the service looks for the
-helper next to its own (symlink-resolved) executable. If the helper is missing the
-engine still works via `say`, just with the old ~1 s floor.
+**Packaging coupling (Homebrew AND nix)**: every install method must ship **both**
+products (`speech-server` and `speech-synthesis-helper`) into the same `bin` — the
+service looks for the helper next to its own (symlink-resolved) executable. If the
+helper is missing the engine still works via `say`, just with the old ~1 s floor — a
+silent degradation that is easy to miss (verified in production: a nix deployment
+without the helper showed ~1.1 s first-audio instead of ~0.3 s, with no errors
+logged above `.notice`). `package.nix` installs both; the Homebrew formula in the tap
+must do the same.
 
 ### PCMConversion utilities
 

@@ -57,6 +57,10 @@ stdenvNoCC.mkDerivation (_finalAttrs: {
     runHook preInstall
 
     install -Dm755 "$TMPDIR/build/release/speech-server" "$out/bin/speech-server"
+    # The speechsynthesis engine looks for this helper next to the server
+    # binary; without it the engine falls back to `say` (~1 s slower warm
+    # time-to-first-audio for the System Voice).
+    install -Dm755 "$TMPDIR/build/release/speech-synthesis-helper" "$out/bin/speech-synthesis-helper"
 
     runHook postInstall
   '';
