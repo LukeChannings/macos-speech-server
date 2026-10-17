@@ -1,8 +1,8 @@
 # Installation guide
 
 Advanced installation topics for macos-speech-server: running as a system service at boot,
-switching between the per-user and system service, upgrading the system service, and migrating
-from the old pre-0.1 `deploy/` scripts. For basic installation, see
+switching between the per-user and system service, upgrading the system service, migrating
+from the old pre-0.1 `deploy/` scripts, and the nix-darwin module. For basic installation, see
 [Installation](../README.md#installation) in the README.
 
 ## Run at system startup (optional)
@@ -72,3 +72,56 @@ sudo brew services restart macos-speech-server --sudo-service-user _speech-serve
 ## Migrating from the old deploy/ scripts
 
 If you installed a pre-0.1 version with `deploy/install-agent.sh` or `deploy/install-daemon.sh`, the old `com.local.speech-server` launchd job must be removed **before** `brew install`. See [upgrading-pre-0_1.md](upgrading-pre-0_1.md) for the steps, including how to keep your old config and model cache.
+
+## nix-darwin module
+
+The flake exports `darwinModules.default`, which defines `services.speech-server`:
+
+```nix
+{
+  inputs.macos-speech-server.url = "github:LukeChannings/macos-speech-server";
+
+  outputs = { nix-darwin, macos-speech-server, ... }: {
+    darwinConfigurations.my-mac = nix-darwin.lib.darwinSystem {
+      modules = [
+        macos-speech-server.darwinModules.default
+        {
+          system.primaryUser = "alice"; # the agent runs in this user's GUI session
+          services.speech-server = {
+            enable = true;
+            # Rendered to YAML and passed via SPEECH_SERVER_CONFIG.
+            # Same schema as speech-server.yaml.example; every key is optional.
+            settings = {
+              servers.wyoming.host = "::";
+              stt.engine = "parakeet";
+              tts = {
+                engine = "speechsynthesis";
+                speechsynthesis.default_voice = "System Voice";
+              };
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enable` | `false` | Install and load the launchd agent. |
+| `package` | `pkgs.speech-server` if an overlay provides it, otherwise this flake's package | The build to run. It must contain `speech-synthesis-helper` alongside `speech-server` (the flake's package does). |
+| `settings` | `{ }` | The whole `speech-server.yaml` as a Nix attrset. |
+
+**Why a gui agent, not a system daemon.** The module installs the agent through `launchd.user.agents` into `~<system.primaryUser>/Library/LaunchAgents`, limited to Aqua (GUI) sessions, with `RunAtLoad`, `KeepAlive` and `ProcessType = Background`. Premium/Enhanced voices, the Siri voices that `say` can reach, and the user's System Voice setting are only available inside a GUI login session. A LaunchDaemon, whether it runs as root or as a role account, sees only the ~70 built-in compact voices (see [Run at system startup](#run-at-system-startup-optional)). The server therefore runs only while the primary user is logged in; enable automatic login if the Mac has to serve after a reboot. `HOME` comes from that session, so the models are cached in the user's `~/Library/Application Support/FluidAudio` and `~/.cache/fluidaudio`.
+
+**Logs.** stdout and stderr go to `~/Library/Logs/speech-server.log` by default. The module sets this with `mkDefault`, so an ordinary assignment overrides it:
+
+```nix
+launchd.user.agents.speech-server.serviceConfig = {
+  StandardOutPath = "/var/log/launchd/org.nixos.speech-server.log";
+  StandardErrorPath = "/var/log/launchd/org.nixos.speech-server.log";
+};
+```
+
+The module does not set up log rotation. launchd opens the log file as the agent's user, so a path outside that user's home has to exist and be owned by them before the agent starts.

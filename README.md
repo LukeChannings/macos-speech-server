@@ -67,6 +67,21 @@ If you run the system service, see [docs/install.md#upgrading-the-system-service
 
 Bottles are built for Apple Silicon on macOS 15+. On macOS 14 or Intel, Homebrew builds from source, which requires Swift 6.2 (Xcode 26 or matching Command Line Tools, macOS 15+) -- so macOS 14 currently can't install via Homebrew, and Intel Macs always build from source.
 
+### nix-darwin
+
+The flake exports a nix-darwin module, `darwinModules.default`, that runs the server as a launchd agent in `system.primaryUser`'s GUI login session, with the config rendered from `settings`:
+
+```nix
+{
+  inputs.macos-speech-server.url = "github:LukeChannings/macos-speech-server";
+  # in your darwinSystem modules:
+  #   macos-speech-server.darwinModules.default
+  #   { services.speech-server = { enable = true; settings.tts.engine = "speechsynthesis"; }; }
+}
+```
+
+> **The server must run in a GUI login session.** The module deliberately installs a per-user gui agent, not a system daemon: premium/Enhanced voices, the Siri voices `say` can reach, and your System Voice setting are only available inside a logged-in GUI session, so a LaunchDaemon gets only the ~70 compact voices. The primary user has to be logged in (enable automatic login if the Mac must serve after a reboot). Option reference and log handling: [docs/install.md#nix-darwin-module](docs/install.md#nix-darwin-module).
+
 ## Quick start (from source)
 
 For contributors, or if Homebrew is not an option. If you installed via Homebrew, skip to [Configuration](#configuration).
@@ -260,7 +275,7 @@ Vapor's `--hostname` and `--port` CLI flags also work and take highest priority 
 
 ## Deployment
 
-Deployment is handled entirely by Homebrew -- see [Installation](#installation). Use `brew services start macos-speech-server` for a per-user service, or [docs/install.md#run-at-system-startup-optional](docs/install.md#run-at-system-startup-optional) for a boot-time service running under a dedicated role account (note the system-voice limitation described there).
+Deployment is handled by Homebrew or the [nix-darwin module](#nix-darwin) -- see [Installation](#installation). With Homebrew, use `brew services start macos-speech-server` for a per-user service, or [docs/install.md#run-at-system-startup-optional](docs/install.md#run-at-system-startup-optional) for a boot-time service running under a dedicated role account (note the system-voice limitation described there).
 
 ## API
 
