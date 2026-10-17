@@ -611,7 +611,8 @@ Homebrew tap (see [Distribution (Homebrew)](#distribution-homebrew) and
 
 ## Distribution (Homebrew)
 
-Homebrew is the only supported installation method. The tap is
+Homebrew is the primary installation method (nix-darwin is the other one — see
+[Distribution (nix / nix-darwin)](#distribution-nix--nix-darwin)). The tap is
 [`dokterbob/homebrew-macos-speech-server`](https://github.com/dokterbob/homebrew-macos-speech-server)
 (GitHub repo `dokterbob/homebrew-macos-speech-server`), formula `macos-speech-server`. The
 binary installed by the formula is still named `speech-server`. There is no `deploy/`
@@ -722,6 +723,45 @@ logged-in GUI user against the server's `describe` (Wyoming) or voices output wh
 each mode. The warning lives in the README's Installation → Advanced installation subsection and
 at the top of `docs/install.md` → Run at system startup (optional); the tap formula's caveats
 carry the same warning for `brew info` / `brew services` output.
+
+## Distribution (nix / nix-darwin)
+
+`flake.nix` (flake-parts) exports `packages.<system>.speech-server` (`package.nix`, a
+non-hermetic `__noChroot` build that calls the system Xcode toolchain) and
+`darwinModules.default` (`nix/modules/nix-darwin.nix`, options in `nix/modules/options.nix`).
+`nix/flake-parts/darwinModules.nix` declares the `flake.darwinModules` option, which flake-parts
+doesn't provide itself. The layout follows zmq-detect: the project repo ships both the package
+and its nix module.
+
+**`services.speech-server`**: `enable`, `package`, `settings`. `settings` is freeform
+(`pkgs.formats.yaml`), rendered to a store file and passed as `SPEECH_SERVER_CONFIG`.
+`package` defaults to `pkgs.speech-server` when an overlay provides it, otherwise
+`pkgs.callPackage ../../package.nix {}`, i.e. this flake's own recipe built against the
+consumer's nixpkgs.
+
+**It is a gui user agent, never a system daemon**: `launchd.user.agents.speech-server`
+(installed into `~<system.primaryUser>/Library/LaunchAgents` and loaded through `launchctl
+asuser`), with `LimitLoadToSessionType = Aqua` (mkDefault), `RunAtLoad`, `KeepAlive`, and
+`ProcessType = Background`. The reason is the GUI-login-session voice limit described above: a
+LaunchDaemon only sees the compact voices, and the user's System Voice / Siri setting is
+per-session. HOME is inherited from the session, so model caches end up in the user's
+`~/Library`. An earlier version of the module was a `launchd.daemons` job with `stateDir` /
+`logDir` options. Those options are now `mkRemovedOptionModule` stubs, so a stale config gets an
+explanatory assertion instead of being silently ignored.
+
+**Log paths are `mkDefault` only** (`~/Library/Logs/speech-server.log`, using
+`users.users.<primaryUser>.home` when it is declared and `/Users/<name>` otherwise). Host-level
+log funnels or plain assignments must be able to override them, so never pin
+`StandardOutPath`/`StandardErrorPath` at normal priority. The module doesn't rotate logs.
+launchd opens the file as the agent's user, so a host that moves the log out of `~` has to
+pre-create it with the right owner.
+
+**Verifying module changes** without building (the package build needs network access and
+Xcode): evaluate a throwaway `darwinSystem` that imports `darwinModules.default` and inspect
+`config.launchd.user.agents.speech-server.serviceConfig`,
+`config.environment.userLaunchAgents."org.nixos.speech-server.plist".text`, failed
+`config.assertions`, and `system.drvPath`. Run `nix fmt -- --ci` and `nix flake check
+--no-build` as well.
 
 ## Release process
 
