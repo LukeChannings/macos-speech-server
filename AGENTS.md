@@ -741,18 +741,36 @@ consumer's nixpkgs.
 
 **It is a gui user agent, never a system daemon**: `launchd.user.agents.speech-server`
 (installed into `~<system.primaryUser>/Library/LaunchAgents` and loaded through `launchctl
-asuser`), with `LimitLoadToSessionType = Aqua` (mkDefault), `RunAtLoad`, `KeepAlive`, and
-`ProcessType = Background`. The reason is the GUI-login-session voice limit described above: a
+asuser`), with `LimitLoadToSessionType = Aqua`, `RunAtLoad`, `KeepAlive`, and
+`ProcessType = Background`, all at mkDefault so a host can change them without mkForce. The reason is the GUI-login-session voice limit described above: a
 LaunchDaemon only sees the compact voices, and the user's System Voice / Siri setting is
 per-session. HOME is inherited from the session, so model caches end up in the user's
 `~/Library`. An earlier version of the module was a `launchd.daemons` job with `stateDir` /
 `logDir` options. Those options are now `mkRemovedOptionModule` stubs, so a stale config gets an
-explanatory assertion instead of being silently ignored.
+explanatory assertion instead of being silently ignored. No `WorkingDirectory` is set (cwd is
+`/`), and that is intentional: the config comes from `SPEECH_SERVER_CONFIG` and the caches
+from HOME, so don't restore a state dir.
 
-**Log paths are `mkDefault` only** (`~/Library/Logs/speech-server.log`, using
-`users.users.<primaryUser>.home` when it is declared and `/Users/<name>` otherwise). Host-level
-log funnels or plain assignments must be able to override them, so never pin
-`StandardOutPath`/`StandardErrorPath` at normal priority. The module doesn't rotate logs.
+**Launch via `command`, never a bare store-path `ProgramArguments[0]`.** nix-darwin renders
+`command` as `/bin/sh -c "/bin/wait4path /nix/store && exec …"`. Hosts where `/nix` is a
+late-mounting volume (ZFS, imported minutes after boot, and GUI login can come first) would
+otherwise fail the spawn with errno 2 → `EX_CONFIG` (78). launchd then penalty-boxes the job
+permanently and `KeepAlive` never recovers it. The hartlandia nix-darwin fork plans to assert
+against bare store-path Programs.
+
+**Log path priority is `mkOverride 1250`** (`mkLogDefault` in the module). It defaults to
+`~/Library/Logs/speech-server.log`, using `users.users.<primaryUser>.home` when it is declared
+and `/Users/<name>` otherwise. The priority must sit strictly between mkDefault (1000) and
+mkOptionDefault (1500):
+- At mkDefault, a host log funnel that also uses mkDefault gives an evaluation conflict, not an
+  override.
+- At mkOptionDefault, the value ties with the option's own `default = null`. `nullOr` then
+  fails with "defined both null and not null" on every host **without** a funnel. This was
+  verified, and it is the latent bug litellm `d905a93` had in the fork before `cd14ac9` made
+  its paths plain.
+
+Never pin `StandardOutPath`/`StandardErrorPath` at normal priority. The module doesn't rotate
+logs.
 launchd opens the file as the agent's user, so a host that moves the log out of `~` has to
 pre-create it with the right owner.
 
